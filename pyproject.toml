@@ -1,0 +1,16 @@
+[tool.poetry]
+name = "pyrobosim-gymnasium"
+version = "0.1.0"
+description = ""
+authors = ["Tassos Manganaris <tassos.manganaris@gmail.com>"]
+readme = "README.org"
+
+[tool.poetry.dependencies]
+python = ">=3.12,<3.13"
+pyrobosim = "^4.3.4"
+gymnasium = "^1.3.0"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
