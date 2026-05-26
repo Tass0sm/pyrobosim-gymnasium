@@ -26,7 +26,7 @@ import pyrobosim_gymnasium
 
 class PyRoboGym(gym.Env):
 
-    metadata = {"render_modes": ["human"]}
+    metadata = {"render_modes": ["human", "rgb_array"]}
 
     def __init__(
             self,
@@ -78,10 +78,16 @@ class PyRoboGym(gym.Env):
         )
 
         # Add Objects to the locations for planning tasks
-        self.world.add_object(category="banana", parent=table)
-        self.world.add_object(category="apple", parent=table)
-        self.world.add_object(category="water", parent=desk)
-        self.world.add_object(category="apple", parent=desk)
+        self._objects = {}
+
+        def add_obj(category, parent):
+            obj = self.world.add_object(category=category, parent=parent)
+            self._objects[obj.name] = obj
+
+        add_obj("banana", table)
+        add_obj("apple", table)
+        add_obj("water", desk)
+        add_obj("apple", desk)
 
         # Add robots
         grasp_props = ParallelGraspProperties(
@@ -180,24 +186,36 @@ class PyRoboGym(gym.Env):
         return (self._t, x, x_dot), 0.0, False, False, {}
 
     def _get_obs(self):
+        water0 = self._objects["water0"]
+
         x = np.array([self.robot.dynamics.pose.x,
                       self.robot.dynamics.pose.y,
-                      self.robot.dynamics.pose.get_yaw()])
-        x_dot = self.robot.dynamics.velocity
+                      self.robot.dynamics.pose.get_yaw(),
+                      water0.pose.x,
+                      water0.pose.y])
+        x_dot = np.concatenate([self.robot.dynamics.velocity,
+                                np.array([0.0, 0.0])])
         return x, x_dot
     
     def render(self):
-        if self.render_mode != "human":
+        if self.render_mode not in ("human", "rgb_array"):
             return
         if self._app is None:
             import sys
             from pyrobosim.gui.main import PyRoboSimGUI
-            self._app = PyRoboSimGUI(self.world, sys.argv)
+            self._app = PyRoboSimGUI(self.world, sys.argv, show=(self.render_mode == "human"))
         canvas = self._app.main_window.canvas
         canvas.update_robots_plot()
-        canvas.queue_draw()
-        canvas.draw_and_sleep()
-        self._app.processEvents()
+        if self.render_mode == "human":
+            canvas.queue_draw()
+            canvas.draw_and_sleep()
+            self._app.processEvents()
+        else:
+            canvas.fig.canvas.draw()
+            buf = canvas.fig.canvas.buffer_rgba()
+            w, h = canvas.fig.canvas.get_width_height()
+            img = np.frombuffer(buf, dtype=np.uint8).reshape(h, w, 4)
+            return img[:, :, :3]
 
     # other ###################################################################
 
@@ -237,7 +255,7 @@ class PyRoboGym(gym.Env):
         pickup.add_effect(clear(b), False)
         pickup.add_effect(holding(r), True)
         pickup.add_constraint_generator(LambdaConstraintGenerator(
-            lambda goc, node_id: goc.add_linear_eq(node_id, np.eye(3), np.array([1.0, 0.0, 0.0]))
+            lambda goc, node_id: goc.add_robot_to_point_displacement_constraint(node_id, 0, 0, np.array([0.1, 0.0]))
         ))
 
 
@@ -251,7 +269,7 @@ class PyRoboGym(gym.Env):
         putdown.add_effect(clear(b), True)
         putdown.add_effect(holding(r), False)
         putdown.add_constraint_generator(LambdaConstraintGenerator(
-            lambda goc, node_id: goc.add_linear_eq(node_id, np.eye(3), np.array([1.0, 1.0, 0.0]))
+            lambda goc, node_id: goc.add_robot_linear_eq(node_id, 0, np.eye(3), np.array([-1.0, -1.0, 0.0]))
         ))
 
         # Create the problem
