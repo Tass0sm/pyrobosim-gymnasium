@@ -9,6 +9,7 @@ readme = "README.org"
 python = ">=3.12,<3.13"
 pyrobosim = "^4.3.4"
 gymnasium = "^1.3.0"
+planning-with-constraints = { path = "../planning-with-constraints", develop = true }
 
 
 [build-system]
