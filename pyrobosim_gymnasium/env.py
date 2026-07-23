@@ -1,3 +1,5 @@
+import copy
+
 import numpy as np
 import gymnasium as gym
 
@@ -150,7 +152,7 @@ class PyRoboGym(gym.Env):
         self._t += self._dt
 
         if self._cmd_mode == "position":
-            new_pose = self.robot.dynamics.pose
+            new_pose = copy.copy(self.robot.dynamics.pose)
             new_pose.x = cmd[0]
             new_pose.y = cmd[1]
             new_pose.set_euler_angles(yaw = cmd[2])
@@ -160,7 +162,7 @@ class PyRoboGym(gym.Env):
             else:
                 self.robot.set_pose(new_pose)
         elif self._cmd_mode == "velocity":
-            new_pose = self.robot.dynamics.step(cmd_vel, self._dt)
+            new_pose = self.robot.dynamics.step(cmd, self._dt)
 
             if self.robot.is_in_collision(pose=new_pose):
                 self.robot.dynamics.velocity = np.array([0.0, 0.0, 0.0])
