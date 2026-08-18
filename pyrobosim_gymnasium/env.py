@@ -3,13 +3,23 @@ import copy
 import numpy as np
 import gymnasium as gym
 
-from unified_planning.shortcuts import UserType, BoolType, Not, Equals
+from unified_planning.shortcuts import UserType, BoolType
 from unified_planning.model import Problem, Fluent, InstantaneousAction, Object
 
 from planning_with_constraints import (
     ConstraintEnabledInstantaneousAction,
-    LambdaConstraintGenerator
+    LambdaConstraintGenerator,
+    LambdaEdgeConstraintGenerator,
+    UngroundedVariable,
 )
+
+# `goc-mpc`'s symbolic constraint API (used below to build `Pick`/`Place`'s
+# constraint generators) is built on pydrake `Formula`s. `pyrobosim_gymnasium`
+# doesn't declare a direct dependency on `pydrake` itself -- it's pulled in
+# transitively by whatever environment this package is installed into
+# (e.g. `po-goc-mpc`'s `goc-mpc` dependency), the same way `po-goc-mpc`
+# itself never declares `pydrake` directly either.
+from pydrake.symbolic import logical_and
 
 from pyrobosim.core.robot import Robot
 from pyrobosim.core.world import World
@@ -31,6 +41,14 @@ import pyrobosim_gymnasium
 # see identical behavior to before `PyRoboGym` grew multi-robot/room support.
 DEFAULT_ROOM_FOOTPRINT = [(-2.5, -2.5), (2.5, -2.5), (2.5, 2.5), (-2.5, 2.5)]
 DEFAULT_ROBOT_SPECS = [("robot0", Pose())]
+
+# `make_planning_problem`'s `Pick` constraint generator's fallback approach
+# offset/yaw, only used if a surface has no `nav_poses` configured at all
+# (see `_nearest_nav_pose`) -- same 0.15 m magnitude `po_goc_mpc`'s
+# hand-built experiments use (see e.g. `object_grasp_experiment.py`'s
+# `GRASP_OFFSET`).
+PICK_GRASP_OFFSET = np.array([-0.15, 0.0])
+PICK_GRASP_YAW = 0.0
 
 
 class PyRoboGym(gym.Env):
@@ -328,6 +346,10 @@ class PyRoboGym(gym.Env):
             canvas.queue_draw()
             canvas.draw_and_sleep()
             self._app.processEvents()
+            buf = canvas.fig.canvas.buffer_rgba()
+            w, h = canvas.fig.canvas.get_width_height()
+            img = np.frombuffer(buf, dtype=np.uint8).reshape(h, w, 4)
+            return img[:, :, :3]
         else:
             canvas.fig.canvas.draw()
             buf = canvas.fig.canvas.buffer_rgba()
@@ -344,77 +366,355 @@ class PyRoboGym(gym.Env):
             inflation_radius=inflation_radius,
         )
 
-    def make_planning_problem(self):
+    def nearest_nav_pose(self, surface_name, target_xy):
+        """Where `Pick` pins the robot: the closest of `surface_name`'s
+        precomputed, collision-free approach poses (`Location.nav_poses`,
+        and its object-spawn children's -- e.g. a desk's "desktop" spawn
+        region has its own `nav_poses` ringing the desk, distinct from the
+        (here, empty) `Location.nav_poses`) to `target_xy`.
 
-        Location = UserType('Location')
-        Robot = UserType('Robot')
+        A fixed offset from the item's position (e.g. always "0.15m to its
+        west") isn't safe in general: whether that lands the robot clear of
+        the surface's own footprint or inside it depends on which side of
+        the surface the item happens to be on. pyrobosim already computes
+        real approach points for exactly this reason; picking the nearest
+        one is a general, collision-aware replacement for a per-scenario
+        hand-tuned offset constant. Falls back to
+        `PICK_GRASP_OFFSET`/`PICK_GRASP_YAW` if the surface has no nav_poses
+        configured at all.
+
+        A real method (not a `make_planning_problem`-local closure) so a
+        caller with fresher knowledge of an item's true position -- e.g. a
+        driving loop's `on_reset` hook, once it has actually pinned the
+        item, well after `make_planning_problem`/`Pick`'s constraint
+        generator ran against whatever position was live at PLAN-build time
+        -- can recompute the SAME approach point Pick's generator used and
+        correct it in place via `GraphOfConstraints.set_param`, without
+        duplicating this geometry (see `_pick_add`'s use of
+        `goc.add_param`/`goc.param` below)."""
+        loc = next(l for l in self.world.locations if l.name == surface_name)
+        poses = list(loc.nav_poses)
+        for child in loc.children:
+            poses.extend(child.nav_poses)
+        if not poses:
+            return target_xy + PICK_GRASP_OFFSET, PICK_GRASP_YAW
+        best = min(poses, key=lambda p: (p.x - target_xy[0]) ** 2 + (p.y - target_xy[1]) ** 2)
+        return np.array([best.x, best.y]), best.get_yaw()
+
+    def make_planning_problem(self):
+        """Builds a `unified_planning.model.Problem` (types, fluents,
+        actions, objects, and initial values) reflecting this env's live
+        `World` state: one `Robot` object per `self.robots`, one `Surface`
+        object per `self.world.locations` (tables/desks), one `Item` object
+        per `self._objects` (graspable objects).
+
+        No goal is set here -- callers add the goal for their specific task
+        (`problem.add_goal(...)`) and solve with PCOP
+        (`po_goc_mpc.symbolic_planning`).
+
+        `Pick`/`Place` are `ConstraintEnabledInstantaneousAction`s whose
+        generators emit goc-mpc's symbolic-formula constraint API
+        (`goc.add_constraint`/`goc.add_edge_constraint` with pydrake
+        `Formula`s), the same style `object_grasp_experiment.py`/
+        `object_handoff_experiment.py` hand-build, rather than the old typed
+        convenience calls (`add_robot_to_point_displacement_constraint`,
+        `add_robot_linear_eq`). `Move` is deliberately a plain
+        `InstantaneousAction` (no constraint generator): it exists only so
+        the planner can satisfy `Pick`'s `robot_at` precondition, and is
+        skipped entirely by the plan-to-GoC translator
+        (`po_goc_mpc.symbolic_planning.goc_builder`) -- an unconstrained
+        node in the middle of the GoC isn't expected to resolve, so `Move`
+        contributes no geometry, only task-planning-time causal structure.
+        """
+        Surface = UserType('Surface')
+        RobotType = UserType('Robot')
+        Item = UserType('Item')
 
         # Define fluents
-        holding = Fluent('holding', BoolType(), r=Robot)
-        on = Fluent('on', BoolType(), b=Location, l=Location)  # block b is on location l
-        clear = Fluent('clear', BoolType(), l=Location)        # location is clear
+        robot_at = Fluent('robot_at', BoolType(), r=RobotType, s=Surface)
+        on = Fluent('on', BoolType(), i=Item, s=Surface)          # item i is on surface s
+        holding = Fluent('holding', BoolType(), r=RobotType, i=Item)
+        hand_empty = Fluent('hand_empty', BoolType(), r=RobotType)
 
-        # Create objects
-        robot1 = Object('robot1', Robot)
-        robot2 = Object('robot2', Robot)
-        A = Object('A', Location)
-        B = Object('B', Location)
-        table = Object('table', Location)
+        # Create objects from live World state
+        robot_objs = {robot.name: Object(robot.name, RobotType) for robot in self.robots}
+        surface_objs = {loc.name: Object(loc.name, Surface) for loc in self.world.locations}
+        item_objs = {name: Object(name, Item) for name in self._objects}
+
+        # Alias -- see PyRoboGym.nearest_nav_pose (a real method, not a
+        # local closure, so an on_reset hook with fresher item-position
+        # knowledge can call the exact same logic later via
+        # env.nearest_nav_pose -- see _pick_add's use of goc.add_param below).
+        _nearest_nav_pose = self.nearest_nav_pose
+
+        def _place_region_bounds(surface_name, item_xy):
+            """Continuous, collision-free placement region for `Place` to
+            search over (see `_place_add`): a 1D band running along
+            whichever side of `surface_name` is nearest `item_xy` (via
+            `_nearest_nav_pose`), pinned on the approach axis to that
+            nav_pose's own already-collision-free coordinate, and free to
+            slide along the OTHER axis across the surface's own extent.
+
+            A box over the surface's own footprint (what this used to be)
+            is NOT safe: PyRoboGym's carry model glues a held item exactly
+            to the robot's own pose (`step()`'s
+            `robot.manipulated_object.set_pose(robot.get_pose())`, zero
+            standoff), so the item's resting position has to be
+            collision-free FOR THE ROBOT, not merely "on" the surface --
+            and a surface's own footprint is normally inside the robot's
+            collision zone (confirmed: `table0`'s tabletop spawn region
+            (-1.85, -2.0, -1.15, -1.0) sits entirely inside its own
+            physical footprint (-1.95, -2.1, -1.05, -0.9)). Pinning the
+            band to the nearest nav_pose's coordinate on one axis keeps
+            every point in the region strictly outside the surface's own
+            polygon on that axis, exactly like a single pinned nav_pose
+            would, while the other axis is genuinely free.
+
+            Which axis is "the approach axis" is derived from which axis
+            the nearest nav_pose is offset along relative to the surface's
+            own bounding-box center, rather than hardcoded to x or y, so
+            this generalizes past table0's left/right nav_poses to a
+            surface approached from above/below instead.
+            """
+            loc = next(l for l in self.world.locations if l.name == surface_name)
+            xmin, ymin, xmax, ymax = loc.polygon.bounds
+            nav_xy, _ = _nearest_nav_pose(surface_name, item_xy)
+            cx, cy = (xmin + xmax) / 2.0, (ymin + ymax) / 2.0
+            if abs(nav_xy[0] - cx) >= abs(nav_xy[1] - cy):
+                return float(nav_xy[0]), ymin, float(nav_xy[0]), ymax
+            return xmin, float(nav_xy[1]), xmax, float(nav_xy[1])
+
+        def _nearest_surface_name(robot):
+            """Which surface a robot's `robot_at` starts pinned to: this
+            domain is purely qualitative (task-level "who's near what"),
+            not a claim about exact geometry -- real navigation is resolved
+            later by goc-mpc's waypoint/timing solvers, `Move` here is only
+            a symbolic bookkeeping step -- so "nearest surface by Euclidean
+            distance" is a reasonable default even when the robot's actual
+            spawn pose is out in open floor, not literally at any surface.
+            """
+            if not self.world.locations:
+                return None
+            best = min(
+                self.world.locations,
+                key=lambda loc: (loc.pose.x - robot.dynamics.pose.x) ** 2
+                                 + (loc.pose.y - robot.dynamics.pose.y) ** 2,
+            )
+            return best.name
 
         # Define actions
-        pickup = ConstraintEnabledInstantaneousAction('PickUp', r=Robot, b=Location, l=Location)
-        r, b, l = pickup.parameters
-        pickup.add_precondition(on(b, l))
-        pickup.add_precondition(clear(b))  # block b must be clear to be picked up
-        pickup.add_precondition(clear(l))  # location must be clear (optional, or remove)
-        pickup.add_precondition(Not(holding(r)))
-        pickup.add_effect(on(b, l), False)
-        pickup.add_effect(clear(l), True)
-        pickup.add_effect(clear(b), False)
-        pickup.add_effect(holding(r), True)
-        pickup.add_constraint_generator(LambdaConstraintGenerator(
-            lambda goc, node_id: goc.add_robot_to_point_displacement_constraint(node_id, 0, 0, np.array([0.1, 0.0]))
-        ))
 
+        move = InstantaneousAction('Move', r=RobotType, src=Surface, dst=Surface)
+        r, src, dst = move.parameters
+        move.add_precondition(robot_at(r, src))
+        move.add_effect(robot_at(r, src), False)
+        move.add_effect(robot_at(r, dst), True)
 
-        putdown = ConstraintEnabledInstantaneousAction('PutDown', r=Robot, b=Location, l=Location)
-        r, b, l = putdown.parameters
-        putdown.add_precondition(holding(r))
-        putdown.add_precondition(clear(l))
-        putdown.add_precondition(Not(Equals(b, l)))  # can't put a block down on itself
-        putdown.add_effect(on(b, l), True)
-        putdown.add_effect(clear(l), False, condition=Not(Equals(l, table)))
-        putdown.add_effect(clear(b), True)
-        putdown.add_effect(holding(r), False)
-        putdown.add_constraint_generator(LambdaConstraintGenerator(
-            lambda goc, node_id: goc.add_robot_linear_eq(node_id, 0, np.eye(3), np.array([-1.0, -1.0, 0.0]))
-        ))
+        pick = ConstraintEnabledInstantaneousAction('Pick', r=RobotType, i=Item, s=Surface)
+        r, i, s = pick.parameters
+        pick.add_precondition(robot_at(r, s))
+        pick.add_precondition(on(i, s))
+        pick.add_precondition(hand_empty(r))
+        pick.add_effect(on(i, s), False)
+        pick.add_effect(holding(r, i), True)
+        pick.add_effect(hand_empty(r), False)
+
+        def _pick_add(goc, node_id, params, robot_index, object_index):
+            # `params` are grounded object-name strings, except a Robot
+            # parameter PCOP left unresolved comes through as an
+            # `UngroundedVariable` sentinel instead (see
+            # `po_goc_mpc.symbolic_planning.grounding` -- deferred to
+            # goc-mpc's own assignable-variable machinery rather than
+            # resolved before calling generators).
+            r_name, i_name, s_name = params
+            item = self._objects[i_name]
+            item_xy = np.array([item.pose.x, item.pose.y])
+            approach_xy, approach_yaw = self.nearest_nav_pose(s_name, item_xy)
+            # No object_q pin here: the object's position at THIS node is
+            # already the live, real one via GraphOfConstraints' own
+            # stationarity-to-x0 machinery (both waypoint solvers tie an
+            # un-held object's object_q back to the actual runtime state --
+            # see MILPWaypointMPC's depot exact-rigidity and
+            # EvolutionaryWaypointSolver's _batch_depot_stationary_fn), not
+            # something this generator needs to (re-)assert. A hard pin here
+            # would instead FIGHT that machinery whenever `item_xy` (read at
+            # graph-BUILD time) drifts from the object's true position by
+            # solve time (e.g. it hasn't been placed at its real start pose
+            # yet when make_graph() runs) -- exactly the bug this generator
+            # used to have.
+            #
+            # `approach_xy`/`approach_yaw` (where Pick pins the ROBOT) are
+            # a different story: they're not carried by any dynamics, so
+            # they DO need pinning -- but as goc.add_param placeholders
+            # (an editable runtime constant), not a value baked into the
+            # Formula from this same possibly-stale `item_xy`. A caller with
+            # fresher knowledge of the item's real position (e.g.
+            # on_reset, once it has actually pinned the item -- see
+            # pick_place_single_robot_experiment.py's make_hooks) can correct
+            # these via goc.set_param without touching the constraint's
+            # Formula or the graph/solver structure -- see PyRoboGym.
+            # nearest_nav_pose's docstring.
+            agent_q = (goc.var_agent_q(r_name.var_id) if isinstance(r_name, UngroundedVariable)
+                       else goc.agent_q(robot_index[r_name]))
+            px = goc.add_param(float(approach_xy[0]))
+            py = goc.add_param(float(approach_xy[1]))
+            pyaw = goc.add_param(float(approach_yaw))
+            goc.add_constraint(node_id, agent_q[0] == goc.param(px))
+            goc.add_constraint(node_id, agent_q[1] == goc.param(py))
+            goc.add_constraint(node_id, agent_q[2] == goc.param(pyaw))
+            # Stashed for a runtime on_reset hook to correct once the item's
+            # real start pose is known -- see nearest_nav_pose's docstring.
+            # Overwritten harmlessly if make_planning_problem ever runs more
+            # than once (only the last Pick's params are recoverable this
+            # way; fine for this single-item-single-pick generator).
+            self._pick_runtime_params = {
+                "surface": s_name, "agent_x": px, "agent_y": py, "agent_yaw": pyaw,
+            }
+
+        pick.add_constraint_generator(LambdaConstraintGenerator(_pick_add))
+
+        place = ConstraintEnabledInstantaneousAction('Place', r=RobotType, i=Item, s=Surface)
+        r, i, s = place.parameters
+        place.add_precondition(holding(r, i))
+        place.add_effect(holding(r, i), False)
+        place.add_effect(hand_empty(r), True)
+        place.add_effect(on(i, s), True)
+        place.add_effect(robot_at(r, s), True)
+
+        def _place_add(goc, node_id, params, robot_index, object_index):
+            _r_name, i_name, s_name = params
+            item = self._objects[i_name]
+            item_xy = np.array([item.pose.x, item.pose.y])
+            i_idx = object_index[i_name]
+            # A single pinned target point (the old approach: nearest
+            # collision-free nav_pose to the surface's resting position) is
+            # over-constraining: it forces one specific spot regardless of
+            # whether the robot can actually reach it without crossing an
+            # obstacle. Instead, let the item be placed anywhere along a
+            # collision-free band next to the surface (an inequality
+            # region, not an equality pin -- see `_place_region_bounds` for
+            # why it's a band next to the surface rather than a box over
+            # it) -- the robot's own position at this node is still fully
+            # determined by the transport edge back to Pick
+            # (`_place_edge_add`, unchanged: same relative offset from the
+            # object the robot grasped it at), so freeing the item's
+            # position also frees the robot's, and the waypoint solver's
+            # own edge-cost objective (see po_goc_mpc's `edge_cost_fn=`
+            # wiring) is what picks a point in that region minimizing real
+            # (obstacle-aware) travel cost -- rather than this generator
+            # hand-picking a single point via a Euclidean nearest-neighbor
+            # heuristic that has no idea whether the resulting robot pose is
+            # reachable.
+            xmin, ymin, xmax, ymax = _place_region_bounds(s_name, item_xy)
+            obj_q = goc.object_q(i_idx)
+            goc.add_constraint(node_id, logical_and(
+                obj_q[0] >= xmin, obj_q[0] <= xmax,
+                obj_q[1] >= ymin, obj_q[1] <= ymax,
+            ))
+            # Still deliberately NOT pinning the robot's own position here --
+            # see object_grasp_experiment.py's build_controller docstring:
+            # the robot's (x, y) at the place node is meant to be determined
+            # *purely* by the transport edge back to the grasp node.
+
+        place.add_constraint_generator(LambdaConstraintGenerator(_place_add))
+
+        def _place_edge_add(goc, u_node_id, v_node_id, u_step, u_params, v_params,
+                             robot_index, object_index):
+            # Only add the transport/holding edge constraint if the
+            # predecessor is the matching Pick (same robot AND item) --
+            # domain-specific pairing logic that belongs here, in Place's
+            # own generator, not in the generic plan-to-GoC translator.
+            if u_step.action.name != 'Pick':
+                return
+            u_r, u_i, _u_s = u_params
+            v_r, v_i, _v_s = v_params
+            if u_r != v_r or u_i != v_i:
+                return
+            # `UngroundedVariable(var_id)` compares equal across both params
+            # exactly when they're the same deferred PCOP variable (frozen
+            # dataclass equality), so the check above already covers "same
+            # deferred robot" the same way it covers "same resolved name" --
+            # no special-casing needed there.
+            i_idx = object_index[v_i]
+
+            # Transport (rigid-carry) edge: while grasped, the object moves
+            # rigidly with the robot from u_node_id to v_node_id. Uses the
+            # canonical hold registry (`add_hold`/`add_assignable_hold`,
+            # `GraphOfConstraints`) rather than hand-written
+            # `add_edge_constraint` calls -- see `goc-mpc/examples/
+            # test_hold_registry.py`'s docstring and `GraphOfConstraintsMPC`'s
+            # own `hold_drift_tolerance` doc comment: this single call
+            # replaces both the old rigid-carry edge constraint (`live=True`,
+            # for the waypoint solve) and the separate runtime proximity/
+            # drift check (formerly a second hand-written `HOLDING_MAX_DIST`
+            # edge constraint) -- `GraphOfConstraintsMPC._backtrack` already
+            # re-checks every registered hold's drift against the real state
+            # each control cycle (`_hold_violated`) and reopens `u_node_id`
+            # if it's exceeded, for both a statically-assigned hold and an
+            # assignable one (`_hold_agent` resolves `hold.var_id` via the
+            # solver's own last assignment). That drift check reads real
+            # state through `graph.link_pose`/`graph.point_position`, which
+            # require `GraphOfConstraints(..., workspace_dim=2)` for this
+            # (planar) domain -- see `pick_place_task_experiment.py`'s own
+            # comment on that constructor call, and goc-mpc's `PointPosFromRow`
+            # (utils.hpp), fixed to stop reading past a 2-wide object's own
+            # slice for exactly this case.
+            if isinstance(v_r, UngroundedVariable):
+                goc.add_assignable_hold(u_node_id, v_node_id, v_r.var_id, [i_idx])
+            else:
+                goc.add_hold(u_node_id, v_node_id, robot_index[v_r], [i_idx])
+
+        place.add_edge_constraint_generator(LambdaEdgeConstraintGenerator(_place_edge_add))
 
         # Create the problem
-        problem = Problem('BlockStackingRobots')
-        problem.add_fluent(holding, default_initial_value=False)
+        problem = Problem('PickPlaceTask')
+        problem.add_fluent(robot_at, default_initial_value=False)
         problem.add_fluent(on, default_initial_value=False)
-        problem.add_fluent(clear, default_initial_value=False)
+        problem.add_fluent(holding, default_initial_value=False)
+        problem.add_fluent(hand_empty, default_initial_value=True)
 
-        problem.add_action(pickup)
-        problem.add_action(putdown)
+        problem.add_action(move)
+        problem.add_action(pick)
+        problem.add_action(place)
 
-        problem.add_object(robot1)
-        problem.add_object(robot2)
-        problem.add_object(A)
-        problem.add_object(B)
-        problem.add_object(table)
+        for obj in robot_objs.values():
+            problem.add_object(obj)
+        for obj in surface_objs.values():
+            problem.add_object(obj)
+        for obj in item_objs.values():
+            problem.add_object(obj)
 
-        # Initial state
-        problem.set_initial_value(on(A, table), True)
-        problem.set_initial_value(on(B, table), True)
-        problem.set_initial_value(clear(A), True)
-        problem.set_initial_value(clear(B), True)
-        problem.set_initial_value(clear(table), True)
-        problem.set_initial_value(holding(robot1), False)
-        problem.set_initial_value(holding(robot2), False)
+        # Initial state, read from the live World.
+        for robot in self.robots:
+            r_obj = robot_objs[robot.name]
+            if robot.manipulated_object is not None:
+                i_obj = item_objs[robot.manipulated_object.name]
+                problem.set_initial_value(holding(r_obj, i_obj), True)
+                problem.set_initial_value(hand_empty(r_obj), False)
+            else:
+                nearest = _nearest_surface_name(robot)
+                if nearest is not None:
+                    problem.set_initial_value(robot_at(r_obj, surface_objs[nearest]), True)
 
-        # Goal: B on A
-        problem.add_goal(on(B, A))
+        held_item_names = {robot.manipulated_object.name for robot in self.robots
+                            if robot.manipulated_object is not None}
+        def _surface_name_of(entity):
+            """`Object.parent` is typically an `ObjectSpawn`, not the
+            `Location` itself (see `pyrobosim.core.objects.Object`'s
+            docstring) -- walk up `.parent` links until hitting a name that
+            matches a known `Surface`, or run out of ancestors."""
+            node = entity
+            while node is not None:
+                if node.name in surface_objs:
+                    return node.name
+                node = getattr(node, 'parent', None)
+            return None
+
+        for name, item in self._objects.items():
+            if name in held_item_names:
+                continue
+            surface_name = _surface_name_of(item.parent)
+            if surface_name is not None:
+                problem.set_initial_value(on(item_objs[name], surface_objs[surface_name]), True)
 
         return problem
