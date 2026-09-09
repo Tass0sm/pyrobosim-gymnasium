@@ -1,6 +1,7 @@
 import copy
 
 import numpy as np
+import jax.numpy as jnp
 import gymnasium as gym
 from shapely.geometry import Point
 from shapely.ops import nearest_points
@@ -22,6 +23,15 @@ from planning_with_constraints import (
 # (e.g. `po-goc-mpc`'s `goc-mpc` dependency), the same way `po-goc-mpc`
 # itself never declares `pydrake` directly either.
 from pydrake.symbolic import logical_and
+
+# `goc-mpc`'s analytic-elimination hint for a single node constraint
+# (`GraphOfConstraints.add_constraint`'s `proj=` kwarg). Pulled in the same
+# transitive way as `pydrake` above -- see that comment. Only the
+# evolutionary and `dp_master` waypoint solvers honour a `proj`;
+# `MILPWaypointSolver` and every other consumer ignore it entirely (they
+# keep compiling the constraint's `Formula` as an ordinary residual), so
+# attaching one is always safe.
+from goc_mpc.evolutionary_waypoint_solver.projection import ProjOperator
 
 from pyrobosim.core.robot import Robot
 from pyrobosim.core.world import World
@@ -93,11 +103,57 @@ def _clamp_to_min_margin(xy: np.ndarray, polygon, margin: float) -> np.ndarray:
     return np.array([nearest.x, nearest.y]) + direction / norm * margin
 
 
+def _robot_pose_proj(goc, agent_q, param_ids):
+    """A `ProjOperator` for `Pick`'s robot-pose pin: `agent_q[0:3] ==
+    (param(px), param(py), param(pyaw))`, eliminated analytically instead of
+    driven to via an AL residual.
+
+    The approach pose is a fixed target (a surface's own collision-free
+    nav_pose -- see `PyRoboGym.nearest_nav_pose`); the pinned robot columns
+    are never pulled off it by any other constraint, so there's no
+    continuous search for the waypoint solver to do there. It just
+    substitutes whatever the three `add_param` placeholders currently hold
+    every solve -- still correctable at runtime via `goc.set_param` (e.g. an
+    on_reset hook that has since pinned the item's real start pose), exactly
+    as when this was a plain residual.
+
+    `agent_q` may be a concrete `goc.agent_q(k)` row OR an assignable
+    `goc.var_agent_q(var_id)` row (a PCOP-deferred robot): `ProjOperator`
+    takes both -- the var_agent_q form is a "dynamic pin" whose write target
+    (which agent's slot) follows the solved assignment. Honoured by the
+    evolutionary and `dp_master` waypoint solvers; every other consumer
+    ignores `proj` and keeps the residual.
+
+    `continuous_params=0, discrete_params=1`: a planar (x, y, yaw) pose pin
+    has no ambiguity to branch over. Mirrors
+    `po_goc_mpc.environments.mujoco_env._ee_position_proj` (the same pattern
+    for a manipulator's Cartesian EE-position pin)."""
+    reads = tuple(goc.param(pid) for pid in param_ids)
+
+    def _func(px, py, pyaw, psi, branch):
+        del psi, branch
+        return jnp.stack([px, py, pyaw])
+
+    return ProjOperator(pins=agent_q[0:3], reads=reads, continuous_params=0,
+                        discrete_params=1, func=_func)
 
 
 class PyRoboGym(gym.Env):
 
     metadata = {"render_modes": ["human", "rgb_array"]}
+
+    #: Whether `make_planning_problem`'s `Pick` generator attaches a
+    #: `ProjOperator` (`_robot_pose_proj`) to its robot-pose pin, so the
+    #: evolutionary / `dp_master` waypoint solvers eliminate those columns
+    #: analytically rather than converging them under an AL penalty. Works
+    #: for a concretely-resolved robot (`goc.agent_q(k)`, a static pin) AND
+    #: a PCOP-deferred one (`goc.var_agent_q(var_id)`, a dynamic pin whose
+    #: write target follows the solved assignment -- see `ProjOperator.pins`
+    #: and `_robot_pose_proj`). `True` by default -- the pin is an exact
+    #: substitution either way, and every other waypoint solver ignores the
+    #: `proj` (see the `ProjOperator` import comment). Set to `False` on an
+    #: instance to force the residual.
+    USE_PICK_PROJECTIONS: bool = True
 
     def __init__(
             self,
@@ -607,14 +663,27 @@ class PyRoboGym(gym.Env):
             # these via goc.set_param without touching the constraint's
             # Formula or the graph/solver structure -- see PyRoboGym.
             # nearest_nav_pose's docstring.
-            agent_q = (goc.var_agent_q(r_name.var_id) if isinstance(r_name, UngroundedVariable)
+            is_var = isinstance(r_name, UngroundedVariable)
+            agent_q = (goc.var_agent_q(r_name.var_id) if is_var
                        else goc.agent_q(robot_index[r_name]))
             px = goc.add_param(float(approach_xy[0]))
             py = goc.add_param(float(approach_xy[1]))
             pyaw = goc.add_param(float(approach_yaw))
-            goc.add_constraint(node_id, agent_q[0] == goc.param(px))
-            goc.add_constraint(node_id, agent_q[1] == goc.param(py))
-            goc.add_constraint(node_id, agent_q[2] == goc.param(pyaw))
+            formula = np.array([
+                agent_q[0] == goc.param(px),
+                agent_q[1] == goc.param(py),
+                agent_q[2] == goc.param(pyaw),
+            ])
+            # Eliminate the pinned robot columns analytically rather than
+            # under an AL penalty. `_robot_pose_proj` handles both the
+            # concrete (`goc.agent_q(k)`) and the PCOP-deferred
+            # (`goc.var_agent_q(var_id)`, a dynamic pin) robot -- the
+            # evolutionary and `dp_master` solvers honour either; every
+            # other consumer ignores `proj` and keeps the residual. See
+            # `USE_PICK_PROJECTIONS` and `_robot_pose_proj`.
+            proj = (_robot_pose_proj(goc, agent_q, [px, py, pyaw])
+                    if self.USE_PICK_PROJECTIONS else None)
+            goc.add_constraint(node_id, formula, proj=proj)
             # Stashed for a runtime on_reset hook to correct once the item's
             # real start pose is known -- see nearest_nav_pose's docstring.
             # Overwritten harmlessly if make_planning_problem ever runs more
