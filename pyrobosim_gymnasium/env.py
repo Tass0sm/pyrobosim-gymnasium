@@ -2,6 +2,8 @@ import copy
 
 import numpy as np
 import gymnasium as gym
+from shapely.geometry import Point
+from shapely.ops import nearest_points
 
 from unified_planning.shortcuts import UserType, BoolType
 from unified_planning.model import Problem, Fluent, InstantaneousAction, Object
@@ -49,6 +51,48 @@ DEFAULT_ROBOT_SPECS = [("robot0", Pose())]
 # `GRASP_OFFSET`).
 PICK_GRASP_OFFSET = np.array([-0.15, 0.0])
 PICK_GRASP_YAW = 0.0
+
+# Minimum clearance (m) `nearest_nav_pose` guarantees between an approach
+# point (where Pick pins the robot; where Place's band lets the robot/item
+# slide -- see `_place_region_bounds`) and the surface's own polygon
+# footprint, enforced regardless of how close a surface's own configured
+# `Location.nav_poses` happen to sit (e.g. `example_location_data_furniture.
+# yaml`'s per-category data, not something this package controls). Was
+# discovered empirically, not derived: `po_goc_mpc.experiments.pyrobosim.
+# run.py`'s FMM-based `edge_cost_fn`/`inflation_radius` occupancy inflation
+# needs the same real-world corridor a Pick/Place approach point already
+# assumes is clear to route through -- raising that inflation past what a
+# surface's nav_poses happened to leave (table0's are exactly 0.3 m clear,
+# confirmed directly) silently pushed real Place targets onto occupied
+# cells and broke the waypoint solver's GA search for them (flat
+# `OBSTACLE_FILL` cost has no usable gradient). This constant makes 0.3 m
+# an explicit floor every surface gets, not an incidental property of
+# table0's own furniture data alone.
+MIN_APPROACH_MARGIN = 0.3
+
+
+def _clamp_to_min_margin(xy: np.ndarray, polygon, margin: float) -> np.ndarray:
+    """Pushes `xy` directly away from `polygon`'s nearest boundary point
+    until it's at least `margin` clear of it, leaving it untouched if it
+    already is. Assumes `xy` starts outside `polygon` (true for any real
+    nav_pose, which pyrobosim places collision-free by construction) --
+    this is a floor applied to an already-safe point, not general
+    obstacle-avoidance routing around one that isn't."""
+    pt = Point(float(xy[0]), float(xy[1]))
+    dist = polygon.exterior.distance(pt)
+    if dist >= margin:
+        return xy
+    nearest = nearest_points(polygon.exterior, pt)[0]
+    direction = np.array([pt.x - nearest.x, pt.y - nearest.y])
+    norm = np.linalg.norm(direction)
+    if norm < 1e-9:
+        # xy sits exactly on the boundary (degenerate) -- no well-defined
+        # outward direction to push along; leave it as-is rather than
+        # guess one.
+        return xy
+    return np.array([nearest.x, nearest.y]) + direction / norm * margin
+
+
 
 
 class PyRoboGym(gym.Env):
@@ -102,13 +146,13 @@ class PyRoboGym(gym.Env):
             table = self.world.add_location(
                 category="table",
                 parent=room_name,
-                pose=Pose(x=-1.5, y=-1.5, z=0.0, yaw=0.0),
+                pose=Pose(x=-1.2, y=-1.2, z=0.0, yaw=0.0),
             )
 
             desk = self.world.add_location(
                 category="desk",
                 parent=room_name,
-                pose=Pose(x=1.5, y=1.5, z=0.0, yaw=0.0)
+                pose=Pose(x=1.2, y=1.2, z=0.0, yaw=0.0)
             )
 
             def add_obj(category, parent):
@@ -391,15 +435,24 @@ class PyRoboGym(gym.Env):
         -- can recompute the SAME approach point Pick's generator used and
         correct it in place via `GraphOfConstraints.set_param`, without
         duplicating this geometry (see `_pick_add`'s use of
-        `goc.add_param`/`goc.param` below)."""
+        `goc.add_param`/`goc.param` below).
+
+        The returned point is clamped (`_clamp_to_min_margin`) to at least
+        `MIN_APPROACH_MARGIN` clear of `surface_name`'s own polygon
+        footprint, regardless of how close the surface's configured
+        `nav_poses` actually sit -- see `MIN_APPROACH_MARGIN`'s own comment
+        for why this is an explicit floor rather than trusting furniture
+        data alone."""
         loc = next(l for l in self.world.locations if l.name == surface_name)
         poses = list(loc.nav_poses)
         for child in loc.children:
             poses.extend(child.nav_poses)
         if not poses:
-            return target_xy + PICK_GRASP_OFFSET, PICK_GRASP_YAW
+            xy = target_xy + PICK_GRASP_OFFSET
+            return _clamp_to_min_margin(xy, loc.polygon, MIN_APPROACH_MARGIN), PICK_GRASP_YAW
         best = min(poses, key=lambda p: (p.x - target_xy[0]) ** 2 + (p.y - target_xy[1]) ** 2)
-        return np.array([best.x, best.y]), best.get_yaw()
+        xy = _clamp_to_min_margin(np.array([best.x, best.y]), loc.polygon, MIN_APPROACH_MARGIN)
+        return xy, best.get_yaw()
 
     def make_planning_problem(self):
         """Builds a `unified_planning.model.Problem` (types, fluents,
